@@ -5,7 +5,7 @@
 </style></head><body><main>
 <canvas id="view" width="320" height="200" tabindex="0" aria-label="Voxel game. Controls are listed below."></canvas>
 <p>W A S D: move · Q / E: turn · R / F: fly up / down · ↑ / ↓: look<br>Backspace or left click: remove · Space or right click: place</p>
-<p>Created by Kieran Schmitt</p>
+<p>Created by Kieran Schmitt, optimized by Julian Reder</p>
 <p id="error" role="alert" hidden></p>
 </main><script id="cpu-source" type="text/plain">
 /* PocketCraft512 - Kieran Schmitt
@@ -79,8 +79,8 @@ class Mini86 {
       if(mode===0&&rm===6){d=u16();base=c=>0;}
       else{base=[c=>c.r[3]+c.r[6],c=>c.r[3]+c.r[7],c=>c.r[5]+c.r[6],c=>c.r[5]+c.r[7],c=>c.r[6],c=>c.r[7],c=>c.r[5],c=>c.r[3]][rm];ss=[2,3,6].includes(rm);}
       if(mode===1)d=i8();else if(mode===2)d=i16();
-      const sg=seg<0?(ss?2:3):seg,addr=c=>(c.s[sg]<<4)+((base(c)+d)&65535);
-      return {n,r:reg(n,b),m:{get:c=>c.read(addr(c),b),set:(c,v)=>c.write(addr(c),v,b)}};
+      const sg=seg<0?(ss?2:3):seg,ea=c=>(base(c)+d)&65535,addr=c=>(c.s[sg]<<4)+ea(c);
+      return {n,r:reg(n,b),ea,m:{get:c=>c.read(addr(c),b),set:(c,v)=>c.write(addr(c),v,b)}};
     };
     let fn;
     if(op<=0x3b&&(op&7)<=3){
@@ -100,17 +100,20 @@ class Mini86 {
     }else if([0x80,0x81,0x83].includes(op)){const b=op===0x80?8:width,o=modrm(b),v=op===0x83?(i8()&(b===32?0xffffffff:65535))>>>0:imm(b);fn=c=>{const z=c.alu(o.n,o.m.get(c),v,b);if(o.n!==7)o.m.set(c,z);};
     }else if(op===0x84||op===0x85){const b=op&1?width:8,o=modrm(b);fn=c=>c.alu(4,o.m.get(c),o.r.get(c),b);
     }else if(op>=0x88&&op<=0x8b){const b=op&1?width:8,o=modrm(b),dst=op&2?o.r:o.m,src=op&2?o.m:o.r;fn=c=>dst.set(c,src.get(c));
+    }else if(op===0x8d){const o=modrm(16);if(!o.ea||width!==16)throw Error('Unsupported LEA');fn=c=>o.r.set(c,o.ea(c));
     }else if(op===0x8e){const o=modrm(16);fn=c=>c.s[o.n]=o.m.get(c);
     }else if(op>=0x90&&op<=0x97){const n=op&7;fn=c=>{const t=c.r[0];c.r[0]=c.r[n];c.r[n]=t;};
     }else if(op===0x98){if(width!==16)throw Error('32-bit CWDE unsupported');fn=c=>c.r[0]=(c.rb(0)<<24)>>24;
     }else if(op>=0xa0&&op<=0xa3){const b=op&1?width:8,offset=u16(),sg=seg<0?3:seg;if(b===32)throw Error('32-bit moffs MOV unsupported');fn=c=>{const address=(c.s[sg]<<4)+offset;if(op&2)c.write(address,b===8?c.rb(0):c.r[0],b);else if(b===8)c.wb(0,c.read(address,b));else c.r[0]=c.read(address,b);};
     }else if(op===0xad){if(width!==16)throw Error('32-bit LODS unsupported');const sg=seg<0?3:seg;fn=c=>{let n=rep?c.r[1]:1;while(n--){c.r[0]=c.read((c.s[sg]<<4)+c.r[6],16);c.r[6]+=c.df?-2:2;}if(rep)c.r[1]=0;};
     }else if(op===0xa8||op===0xa9){const b=op===0xa8?8:width,v=imm(b),dst=reg(0,b);fn=c=>c.alu(4,dst.get(c),v,b);
+    }else if(op===0xaa){fn=c=>{c.mem[(c.s[0]<<4)+c.r[7]]=c.rb(0);c.r[7]+=c.df?-1:1;};
     }else if(op===0xab){fn=c=>{c.write((c.s[0]<<4)+c.r[7],c.r[0],16);c.r[7]+=c.df?-2:2;};
     }else if(op>=0xb0&&op<=0xbf){const b=op<0xb8?8:width,d=reg(op&7,b),v=imm(b);fn=c=>d.set(c,v);
     }else if([0xc0,0xc1,0xd0,0xd1].includes(op)){
       const b=op&1?width:8,o=modrm(b),n=op<0xd0?(u8()&31):1;
       fn=c=>{let v=o.m.get(c);if(!n)return;const sign=b===8?128:32768;
+        if(o.n<2){const k=n%b;v=o.n?(v>>>k)|(v<<(b-k)):(v<<k)|(v>>>(b-k));v&=b===8?255:65535;o.m.set(c,v);c.cf=o.n?v>>>(b-1):v&1;return;}
         if(o.n===5){c.cf=(v>>>(n-1))&1;v>>>=n;}
         else if(o.n===7){c.cf=(v>>>(n-1))&1;if(v&sign)v|=b===8?-256:-65536;v>>=n;}
         else if(o.n===4){c.cf=(v>>>(b-n))&1;v<<=n;}else throw Error('Unsupported shift');
@@ -125,6 +128,7 @@ class Mini86 {
     }else if(op===0xee){fn=c=>c.out(c.r[2],c.rb(0));
     }else if(op===0xef){if(width!==16)throw Error('32-bit OUT unsupported');fn=c=>c.out(c.r[2],c.r[0],16);
     }else if(op===0xf6||op===0xf7){const b=op===0xf6?8:width,o=modrm(b);if(o.n===0){const v=imm(b);fn=c=>c.alu(4,o.m.get(c),v,b);}else if(o.n===2){if(b===32)throw Error('32-bit NOT unsupported');fn=c=>o.m.set(c,~o.m.get(c));}else if(o.n===3)fn=c=>o.m.set(c,c.alu(5,0,o.m.get(c),b));else if((o.n===4||o.n===5)&&b===8)fn=c=>{const left=c.rb(0),right=o.m.get(c),v=o.n===4?left*right:((left<<24)>>24)*((right<<24)>>24);c.r[0]=v;c.cf=o.n===4?v>255:v<-128||v>127;c.of=c.cf;};else if(o.n===4&&b===16)fn=c=>{const v=c.r[0]*o.m.get(c);c.r[0]=v;c.r[2]=Math.floor(v/65536);c.cf=v>65535;c.of=c.cf;};else if(o.n===6)fn=c=>{const d=o.m.get(c),n=c.r[2]*65536+c.r[0],q=Math.floor(n/d);if(!d||q>65535)throw Error('Division fault');c.r[0]=q;c.r[2]=n%d;};else throw Error('Unsupported F7 operation');
+    }else if(op===0xf5){fn=c=>c.cf=!c.cf;
     }else if(op===0xf8||op===0xf9){fn=c=>c.cf=op===0xf9;
     }else if(op===0xfc){fn=c=>c.df=0;
     }else if(op===0xfe||op===0xff){const b=op===0xfe?8:width,o=modrm(b);if(o.n>1)throw Error('Unsupported FE/FF operation');fn=c=>{const f=c.cf;o.m.set(c,c.alu(o.n===1?5:0,o.m.get(c),1,b));c.cf=f;};
@@ -181,7 +185,7 @@ class Mini86 {
       else{base=['r[3]+r[6]','r[3]+r[7]','r[5]+r[6]','r[5]+r[7]','r[6]','r[7]','r[5]','r[3]'][rm];ss=[2,3,6].includes(rm);}
       if(mode===1)d=i8();else if(mode===2)d=i16();
       const sg=seg<0?(ss?2:3):seg,a=`((s[${sg}]<<4)+((${base}+${d})&65535))`;
-      return {n,r:reg(n,b),m:mem(a,b)};
+      return {n,r:reg(n,b),ea:`((${base}+${d})&65535)`,m:mem(a,b)};
     };
     const alu=(kind,dst,src,b,write=true)=>{
       const mask=b===8?255:b===16?65535:4294967295,sign=b===8?128:b===16?32768:2147483648;
@@ -210,17 +214,20 @@ class Mini86 {
     }else if([0x80,0x81,0x83].includes(op)){const b=op===0x80?8:width,o=modrm(b),v=op===0x83?(i8()&(b===32?0xffffffff:65535))>>>0:imm(b);code=alu(o.n,o.m,v,b);
     }else if(op===0x84||op===0x85){const b=op&1?width:8,o=modrm(b);code=alu(4,o.m,o.r.get,b,false);
     }else if(op>=0x88&&op<=0x8b){const b=op&1?width:8,o=modrm(b),dst=op&2?o.r:o.m,src=op&2?o.m:o.r;code=dst.set(src.get);
+    }else if(op===0x8d){const o=modrm(16);if(!o.ea||width!==16)throw Error('Unsupported LEA');code=o.r.set(o.ea);
     }else if(op===0x8e){const o=modrm(16);code=`s[${o.n}]=${o.m.get};`;
     }else if(op>=0x90&&op<=0x97){const n=op&7;code=`v=r[0];r[0]=r[${n}];r[${n}]=v;`;
     }else if(op===0x98){if(width!==16)throw Error('32-bit CWDE unsupported');code='r[0]=(r[0]<<24)>>24;';
     }else if(op>=0xa0&&op<=0xa3){const b=op&1?width:8,offset=u16(),sg=seg<0?3:seg;if(b===32)throw Error('32-bit moffs MOV unsupported');const operand=mem(`((s[${sg}]<<4)+${offset})`,b),accumulator=reg(0,b);code=op&2?operand.set(accumulator.get):accumulator.set(operand.get);
     }else if(op===0xad){if(width!==16)throw Error('32-bit LODS unsupported');const sg=seg<0?3:seg;code=`v=${rep?'r[1]':'1'};while(v--){r[0]=c.read((s[${sg}]<<4)+r[6],16);r[6]+=c.df?-2:2;}${rep?'r[1]=0;':''}`;
     }else if(op===0xa8||op===0xa9){const b=op===0xa8?8:width,v=imm(b);code=alu(4,reg(0,b),v,b,false);
+    }else if(op===0xaa){code='m[(s[0]<<4)+r[7]]=r[0]&255;r[7]+=c.df?-1:1;';
     }else if(op===0xab){code='c.write((s[0]<<4)+r[7],r[0],16);r[7]+=c.df?-2:2;';
     }else if(op>=0xb0&&op<=0xbf){const b=op<0xb8?8:width,d=reg(op&7,b),v=imm(b);code=d.set(v);
     }else if([0xc0,0xc1,0xd0,0xd1].includes(op)){
       const b=op&1?width:8,o=modrm(b),n=op<0xd0?u8()&31:1,sign=b===8?128:32768;
-      if(n){code=`v=${o.m.get};`;
+      if(n&&o.n<2){const k=n%b,mask=b===8?255:65535;code=`v=${o.m.get};v=(${o.n?`(v>>>${k})|(v<<${b-k})`:`(v<<${k})|(v>>>${b-k})`})&${mask};`+o.m.set('v')+`c.cf=${o.n?`v>>>${b-1}`:'v&1'};`;}
+      else if(n){code=`v=${o.m.get};`;
         if(o.n===5)code+=`c.cf=(v>>>${n-1})&1;v>>>=${n};`;
         else if(o.n===7)code+=`c.cf=(v>>>${n-1})&1;if(v&${sign})v|=${b===8?-256:-65536};v>>=${n};`;
         else if(o.n===4)code+=`c.cf=(v>>>${b-n})&1;v<<=${n};`;
@@ -244,6 +251,7 @@ class Mini86 {
       else if(o.n===4&&b===16)code=`v=r[0]*${o.m.get};r[0]=v;r[2]=Math.floor(v/65536);c.cf=v>65535;c.of=v>65535;`;
       else if(o.n===6)code=`a=${o.m.get};b=r[2]*65536+r[0];v=Math.floor(b/a);if(!a||v>65535)throw Error('Division fault');r[0]=v;r[2]=b%a;`;
       else throw Error('Unsupported F7 operation');
+    }else if(op===0xf5){code='v=c.cf;c.cf=!v;';
     }else if(op===0xf8||op===0xf9){code=`c.cf=${op===0xf9};`;
     }else if(op===0xfc){code='c.df=0;';
     }else if(op===0xfe||op===0xff){const b=op===0xfe?8:width,o=modrm(b);if(o.n>1)throw Error('Unsupported FE/FF operation');code=alu(o.n===1?5:0,o.m,1,b).replace(/c\.cf=[^;]+;/g,'');
@@ -482,17 +490,18 @@ class InputController {
   }
 }
 if(typeof module!=='undefined')module.exports=InputController;
-const binary=Uint8Array.from(atob('McCO0LwAfPywE80QutQDuAlD72gAoAdoAIAfMduJ2NHo1BAtCAeI4vbolojQ9ugB8MHoBDwFcgKwBQQHiPrA6gI4wrCLdwYYwPbQJI+IB0N5y2ooagC4ACJQaAAWUInlg2YGP2aDTgr/v6CAifqA5n+B6qAAuMAA6DkBiVYOiUYSi0YIhf94A4PoZIlGEFhaXlZSULlgAOj4AFMDRg4DVhADdhLo6wByCXVNg8QC4urrR4jMWYnOMd66AHyF1nUFweoF6/eF/3kPiV4KIdYx3oD8WHcDiXYM9sZ8igd1CfbCH7CKdQIER4D8SHMCBBg7Xgp1ByxI6wNbsGaF/3hQiMSrgcc+AYNGEAKB/wB9D4J8/4HvAn0PiVL/McDNFoTAdQKI4JK+5X25DAA2rTjU4Pp1GZiSgPkKchpBgOH+ic6LGoT/eAaEF3UCiBfpEf+/QH7rvoDh/ot2BPbBCnUTMcCEyXQBklboSgBeAcaSMdLrB4D5AnUVMcADRgADVgLoEAB1BoPEBlZSUOvAic4BEuu6ifMJwwnTeBlQifPB6wWB4+ADwegKCcOJ0CUAfAnDWDovw4tOBlGD4Q/jHGvYGWvyGQHGg8Z/wf4IKfAp04PrgMH7CAHa4uRZwekE4wWS99ji+8OPIAAIAlD+SAFl/3Fgd6BzYGagcmBkoGEAVao='),x=>x.charCodeAt(0));
+const binary=Uint8Array.from(atob('McCO0LwAfPywE80QutQDuAlD747YaNCfBzHbidjR6NQQLQgHiOL26JL26AHQwegEPAVyArAFBAeI+sDqAjjQsI90BBjAJIuIB0N5z2rEU7gAIlBoABZQieVmg04K/78AgDHSi0YIg8BkiUYQ6PUAiVYOiUYSWFpeVlJQsWDoxQCJXhTotgDh+HM9i3YUMd66D4DBygWF1nT5hf95D4leCiHWMd6A+Vd3A4l2DITSigd0BrCKeQIER4D5R3MCBBg7Xgp1BSxIqbBmg0YQAqqqgcc+AXmgi0YIge8CgI29AAONlWD8c4MxwM0Wkr6QfbEMNq049OD6dUGYkoD5CnMwMcAx9oDh/nQIgPkEdxxyCJLoVACWkjHSVYPtDugeAF11GIPEBlZSUOsQic4BEusKi5p4goQXdQKIF+kd/wNGDgNWEAN2EonzCcMJ03gWUInzwesFgOPgwegKiPSA5HwJw1g6L8O4wACLTgZRg+EP4xZr2Blr8ucpxinTwf4IEfDB+wgR2uLqWcHpBJL32OL7wwAOjzkCUP5IARL/EGARoB9gIaATYCCgHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVao='),x=>x.charCodeAt(0));
 const canvas=document.getElementById('view'),ctx=canvas.getContext('2d',{alpha:false}),errorEl=document.getElementById('error');
 const cpuSource=document.getElementById('cpu-source').textContent;
 // worker connects the CPU, display and keyboard; the binary runs the game
 const workerSource=cpuSource+`\nlet cpu;onmessage=e=>{try{const data=e.data;if(data.type==='boot')cpu=new Mini86(data.binary);else if(data.type==='key')cpu.key(data.key);else return;const t=performance.now();let chunks=0;while(!cpu.run(2000000))if(++chunks>100)throw Error('CPU instruction budget exceeded');const pixels=new Uint8ClampedArray(320*200*4);for(let y=0;y<200;y++){const row=cpu.displayOffset(0,y);for(let x=0;x<320;x++){const rgb=cpu.palette[cpu.mem[0xa0000+row+x]],j=(y*320+x)*4;pixels[j]=rgb[0];pixels[j+1]=rgb[1];pixels[j+2]=rgb[2];pixels[j+3]=255;}}postMessage({type:'frame',pixels,ms:performance.now()-t},[pixels.buffer]);}catch(error){postMessage({type:'error',message:error.message});}};`;
 let worker,busy=true,failed=false,timer=null,paintRequest=null,pendingFrame=null,frameCount=0,lastSentKey=null;
-const input=new InputController({repeatMs:33,opposing:[[119,115],[97,100],[113,101],[114,102],[18432,20480]]});
+const input=new InputController({repeatMs:33,opposing:[[0x1177,0x1f73],[0x1e61,0x2064],[0x1071,0x1265],[0x1372,0x2166],[0x4800,0x5000]]});
 const frameMetrics=[];
 // recent frame timings for debugging, returns copies
 window.pocketCraftMetrics=()=>frameMetrics.map(frame=>({...frame}));
-const keys={w:119,a:97,s:115,d:100,q:113,e:101,r:114,f:102,ArrowUp:18432,ArrowDown:20480,Backspace:8,' ':32};
+// BIOS key words: scan code << 8 | ASCII
+const keys={w:0x1177,a:0x1e61,s:0x1f73,d:0x2064,q:0x1071,e:0x1265,r:0x1372,f:0x2166,ArrowUp:0x4800,ArrowDown:0x5000,Backspace:0x0e08,' ':0x3920};
 function clearInput(){input.clear();clearTimeout(timer);timer=null;}
 function fail(message){failed=true;busy=false;clearInput();if(paintRequest!==null)cancelAnimationFrame(paintRequest);paintRequest=null;pendingFrame=null;errorEl.textContent=message;errorEl.hidden=false;}
 function schedule(){
@@ -539,13 +548,13 @@ function reset(){
 window.addEventListener('keydown',e=>{
   if(e.ctrlKey||e.metaKey||e.altKey||e.target?.isContentEditable||e.target?.matches?.('input,textarea,select'))return;
   const key=e.key.length===1?e.key.toLowerCase():e.key;
-  if(key in keys){e.preventDefault();if(!e.repeat){if(keys[key]===8||keys[key]===32)tap(keys[key]);else press('key:'+e.code,keys[key]);}}
+  if(key in keys){e.preventDefault();if(!e.repeat){if(keys[key]===0x0e08||keys[key]===0x3920)tap(keys[key]);else press('key:'+e.code,keys[key]);}}
 });
 window.addEventListener('keyup',e=>release('key:'+e.code));
 window.addEventListener('blur',clearInput);
 document.addEventListener('visibilitychange',()=>{if(document.hidden)clearInput();else schedule();});
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
-canvas.addEventListener('pointerdown',e=>{canvas.focus({preventScroll:true});if(e.pointerType==='mouse'&&(e.button===0||e.button===2)){e.preventDefault();tap(e.button===2?32:8);}});
+canvas.addEventListener('pointerdown',e=>{canvas.focus({preventScroll:true});if(e.pointerType==='mouse'&&(e.button===0||e.button===2)){e.preventDefault();tap(e.button===2?0x3920:0x0e08);}});
 reset();
 </script></body></html>
 
