@@ -59,8 +59,6 @@ objcopy -O binary -j .text PocketCraft512.elf PocketCraft512.img
 wc -c PocketCraft512.img
 ```
 
-Should come out to **512 bytes**: 485 for instructions, 24 for the key table, 1 padding byte and 2 for the boot signature.
-
 ## Limits
 
 The world has boundaries and you fly freely. Fixed ray steps mean block edges can look rough at some angles. No gravity, inventory or saving yet; restarting resets the world.
