@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="author" content="Kieran Schmitt"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PocketCraft 512</title><style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0c0c0c;color:#ccc}body{margin:0;padding:24px 16px}main{max-width:800px;margin:auto}canvas{display:block;width:100%;height:auto;aspect-ratio:8/5;image-rendering:pixelated;background:#000;outline:none}p{font-size:13px;line-height:1.7;margin:16px 0 0}
+</style></head><body><main>
+<canvas id="view" width="320" height="200" tabindex="0" aria-label="Voxel game. Controls are listed below."></canvas>
+<p>W A S D: move · Q / E: turn · R / F: fly up / down · ↑ / ↓: look<br>Backspace or left click: remove · Space or right click: place</p>
+<p>Created by Kieran Schmitt</p>
+<p id="error" role="alert" hidden></p>
+</main><script id="cpu-source" type="text/plain">
+/* PocketCraft512 - Kieran Schmitt
+ * small x86 emulator, game lives in the loaded binary
+ * handles BIOS keyboard/video calls and VGA DAC ports
+ * caches translated x86 blocks, no game logic or hardcoded game addresses here
+ * unsupported instructions throw; self-modifying code isn't supported
+ * call invalidate() after editing guest code externally
+ */
+class Mini86 {
+  constructor(bytes) {
+    this.mem=new Uint8Array(2*1024*1024);
+    this.mem.set(bytes,0x7c00);
+    this.r=new Uint16Array(8); this.s=new Uint16Array(4);
+    this.ip=0x7c00; this.cf=0; this.zf=0; this.sf=0; this.of=0;
+    this.df=0; this.waiting=false; this.cache=new Map(); this.dac=0; this.compiled=null; this.compiledCS=-1; this.instructions=0; this.crtcIndex=0; this.crtc=new Uint8Array(256); this.crtc[9]=0x41;
+    this.palette=Mini86.defaultPalette();
+  }
+  // SeaVGABIOS mode 13h palette, same defaults for any loaded program
+  static defaultPalette(){
+    const colors=[];
+    for(let i=0;i<16;i++){const bright=i&8?21:0,rgb=[4,2,1].map(bit=>(i&bit?42:0)+bright);if(i===6)rgb[1]=21;colors.push(rgb);}
+    for(const value of [0, 5, 8, 11, 14, 17, 20, 24, 28, 32, 36, 40, 45, 50, 56, 63])colors.push([value,value,value]);
+    for(const values of [[0, 16, 31, 47, 63], [31, 39, 47, 55, 63], [45, 49, 54, 58, 63], [0, 7, 14, 21, 28], [14, 17, 21, 24, 28], [20, 22, 24, 26, 28], [0, 4, 8, 12, 16], [8, 10, 12, 14, 16], [11, 12, 13, 15, 16]]){
+      const low=values[0],high=values[4];
+      for(let j=0;j<4;j++)colors.push([values[j],low,high]);
+      for(let j=0;j<4;j++)colors.push([high,low,values[4-j]]);
+      for(let j=0;j<4;j++)colors.push([high,values[j],low]);
+      for(let j=0;j<4;j++)colors.push([values[4-j],high,low]);
+      for(let j=0;j<4;j++)colors.push([low,high,values[j]]);
+      for(let j=0;j<4;j++)colors.push([low,values[4-j],high]);
+    }
+    for(let i=0;i<8;i++)colors.push([0,0,0]);
+    return colors.map(rgb=>rgb.map(value=>Math.round(value*255/63)));
+  }
+  resetVideo(){
+    this.mem.fill(0,0xa0000,0xb0000);
+    this.crtc.fill(0);this.crtc[9]=0x41;this.crtcIndex=0;
+    this.palette=Mini86.defaultPalette();this.dac=0;
+  }
+  rb(i){return i<4?this.r[i]&255:this.r[i-4]>>>8;}
+  wb(i,v){if(i<4)this.r[i]=(this.r[i]&65280)|(v&255);else this.r[i-4]=(this.r[i-4]&255)|((v&255)<<8);}
+  read(a,bits){let v=this.mem[a];if(bits>8)v|=this.mem[a+1]<<8;if(bits===32)v|=(this.mem[a+2]<<16)|(this.mem[a+3]<<24);return v>>>0;}
+  write(a,v,bits){this.mem[a]=v;if(bits>8)this.mem[a+1]=v>>>8;if(bits===32){this.mem[a+2]=v>>>16;this.mem[a+3]=v>>>24;}}
+  push(v){this.r[4]-=2;this.write((this.s[2]<<4)+this.r[4],v,16);}
+  pop(){const v=this.read((this.s[2]<<4)+this.r[4],16);this.r[4]+=2;return v;}
+  displayOffset(x,y){return Math.floor(y*2/(((this.crtc[9]&31)+1)*((this.crtc[9]&128)?2:1)))*320+x;}
+  out(port,v,bits=8){if(bits===16){this.out(port,v&255);this.out(port+1,(v>>>8)&255);return;}if(bits!==8)throw Error('Unsupported I/O width');if(port===0x3d4)this.crtcIndex=v&255;else if(port===0x3d5)this.crtc[this.crtcIndex]=v;else if(port===0x3c8)this.dac=v*3;else if(port===0x3c9){this.palette[this.dac/3|0][this.dac%3]=Math.round((v&63)*255/63);this.dac=(this.dac+1)%768;}else throw Error('Unsupported I/O port '+port.toString(16));}
+  alu(kind,a,b,bits){
+    const mask=bits===32?0xffffffff:(1<<bits)-1, sign=bits===32?0x80000000:1<<(bits-1);
+    let v;const carry=this.cf?1:0;
+    if(kind===0||kind===2){v=a+b+(kind===2?carry:0);this.cf=bits===32?v>4294967295:v>mask;this.of=!!((~(a^b)&(a^v))&sign);}
+    else if(kind===3||kind===5||kind===7){v=a-b-(kind===3?carry:0);this.cf=(a>>>0)<((b>>>0)+(kind===3?carry:0));this.of=!!(((a^b)&(a^v))&sign);}
+    else {this.cf=0;this.of=0;if(kind===1)v=a|b;else if(kind===4)v=a&b;else if(kind===6)v=a^b;else throw Error('Unsupported ALU operation');}
+    v=(v&mask)>>>0;this.zf=v===0;this.sf=!!(v&sign);return v;
+  }
+  cond(k){switch(k){case 0:return this.of;case 1:return !this.of;case 2:return this.cf;case 3:return !this.cf;case 4:return this.zf;case 5:return !this.zf;case 6:return this.cf||this.zf;case 7:return !this.cf&&!this.zf;case 8:return this.sf;case 9:return !this.sf;case 12:return this.sf!==this.of;case 13:return this.sf===this.of;case 14:return this.zf||this.sf!==this.of;case 15:return !this.zf&&this.sf===this.of;default:throw Error('Unsupported condition');}}
+  decode(start){
+    let p=start, width=16,seg=-1,rep=false;
+    const u8=()=>this.mem[(this.s[1]<<4)+(p++&65535)],u16=()=>u8()|(u8()<<8),i8=()=>((u8()<<24)>>24),i16=()=>((u16()<<16)>>16);
+    const imm=b=>b===8?u8():b===16?u16():(u16()|u16()<<16)>>>0;
+    let op=u8();
+    while([0x26,0x2e,0x36,0x3e,0x66,0xf3].includes(op)){
+      if(op===0x66)width=32;else if(op===0xf3)rep=true;else seg=({38:0,46:1,54:2,62:3})[op];op=u8();
+    }
+    const reg=(n,b)=>({get:c=>b===8?c.rb(n):c.r[n],set:(c,v)=>b===8?c.wb(n,v):c.r[n]=v});
+    const modrm=b=>{
+      const m=u8(),mode=m>>>6,n=(m>>>3)&7,rm=m&7;
+      if(mode===3)return {n,r:reg(n,b),m:reg(rm,b)};
+      let d=0,base,ss=false;
+      if(mode===0&&rm===6){d=u16();base=c=>0;}
+      else{base=[c=>c.r[3]+c.r[6],c=>c.r[3]+c.r[7],c=>c.r[5]+c.r[6],c=>c.r[5]+c.r[7],c=>c.r[6],c=>c.r[7],c=>c.r[5],c=>c.r[3]][rm];ss=[2,3,6].includes(rm);}
+      if(mode===1)d=i8();else if(mode===2)d=i16();
+      const sg=seg<0?(ss?2:3):seg,addr=c=>(c.s[sg]<<4)+((base(c)+d)&65535);
+      return {n,r:reg(n,b),m:{get:c=>c.read(addr(c),b),set:(c,v)=>c.write(addr(c),v,b)}};
+    };
+    let fn;
+    if(op<=0x3b&&(op&7)<=3){
+      const kind=op>>>3,b=(op&1)?width:8,o=modrm(b),dst=(op&2)?o.r:o.m,src=(op&2)?o.m:o.r;
+      fn=c=>{const v=c.alu(kind,dst.get(c),src.get(c),b);if(kind!==7)dst.set(c,v);};
+    }else if(op<=0x3d&&((op&7)===4||(op&7)===5)){
+      const kind=op>>>3,b=(op&1)?width:8,dst=reg(0,b),v=imm(b);fn=c=>{const z=c.alu(kind,dst.get(c),v,b);if(kind!==7)dst.set(c,z);};
+    }else if(op>=0x40&&op<=0x4f){const n=op&7,dec=!!(op&8);fn=c=>{const f=c.cf;c.r[n]=c.alu(dec?5:0,c.r[n],1,16);c.cf=f;};
+    }else if(op>=0x50&&op<=0x57){const n=op&7;fn=c=>c.push(c.r[n]);
+    }else if(op>=0x58&&op<=0x5f){const n=op&7;fn=c=>c.r[n]=c.pop();
+    }else if([6,14,22,30].includes(op)){const n=(op-6)/8;fn=c=>c.push(c.s[n]);
+    }else if([7,23,31].includes(op)){const n=(op-7)/8;fn=c=>c.s[n]=c.pop();
+    }else if(op===0x68||op===0x6a){const v=op===0x6a?i8():u16();fn=c=>c.push(v);
+    }else if(op===0x69||op===0x6b){const o=modrm(width),v=op===0x6b?i8():i16();if(width!==16)throw Error('32-bit IMUL unsupported');fn=c=>{const z=(o.m.get(c)<<16>>16)*v;o.r.set(c,z);c.cf=z<-32768||z>32767;c.of=c.cf;};
+    }else if(op===0x6e){const sg=seg<0?3:seg;fn=c=>{let n=rep?c.r[1]:1;while(n--){c.out(c.r[2],c.mem[(c.s[sg]<<4)+c.r[6]]);c.r[6]+=c.df?-1:1;}if(rep)c.r[1]=0;};
+    }else if(op>=0x70&&op<=0x7f){const n=op&15,d=i8(),target=(p+d)&65535;fn=c=>{if(c.cond(n))c.ip=target;};
+    }else if([0x80,0x81,0x83].includes(op)){const b=op===0x80?8:width,o=modrm(b),v=op===0x83?(i8()&(b===32?0xffffffff:65535))>>>0:imm(b);fn=c=>{const z=c.alu(o.n,o.m.get(c),v,b);if(o.n!==7)o.m.set(c,z);};
+    }else if(op===0x84||op===0x85){const b=op&1?width:8,o=modrm(b);fn=c=>c.alu(4,o.m.get(c),o.r.get(c),b);
+    }else if(op>=0x88&&op<=0x8b){const b=op&1?width:8,o=modrm(b),dst=op&2?o.r:o.m,src=op&2?o.m:o.r;fn=c=>dst.set(c,src.get(c));
+    }else if(op===0x8e){const o=modrm(16);fn=c=>c.s[o.n]=o.m.get(c);
+    }else if(op>=0x90&&op<=0x97){const n=op&7;fn=c=>{const t=c.r[0];c.r[0]=c.r[n];c.r[n]=t;};
+    }else if(op===0x98){if(width!==16)throw Error('32-bit CWDE unsupported');fn=c=>c.r[0]=(c.rb(0)<<24)>>24;
+    }else if(op>=0xa0&&op<=0xa3){const b=op&1?width:8,offset=u16(),sg=seg<0?3:seg;if(b===32)throw Error('32-bit moffs MOV unsupported');fn=c=>{const address=(c.s[sg]<<4)+offset;if(op&2)c.write(address,b===8?c.rb(0):c.r[0],b);else if(b===8)c.wb(0,c.read(address,b));else c.r[0]=c.read(address,b);};
+    }else if(op===0xad){if(width!==16)throw Error('32-bit LODS unsupported');const sg=seg<0?3:seg;fn=c=>{let n=rep?c.r[1]:1;while(n--){c.r[0]=c.read((c.s[sg]<<4)+c.r[6],16);c.r[6]+=c.df?-2:2;}if(rep)c.r[1]=0;};
+    }else if(op===0xa8||op===0xa9){const b=op===0xa8?8:width,v=imm(b),dst=reg(0,b);fn=c=>c.alu(4,dst.get(c),v,b);
+    }else if(op===0xab){fn=c=>{c.write((c.s[0]<<4)+c.r[7],c.r[0],16);c.r[7]+=c.df?-2:2;};
+    }else if(op>=0xb0&&op<=0xbf){const b=op<0xb8?8:width,d=reg(op&7,b),v=imm(b);fn=c=>d.set(c,v);
+    }else if([0xc0,0xc1,0xd0,0xd1].includes(op)){
+      const b=op&1?width:8,o=modrm(b),n=op<0xd0?(u8()&31):1;
+      fn=c=>{let v=o.m.get(c);if(!n)return;const sign=b===8?128:32768;
+        if(o.n===5){c.cf=(v>>>(n-1))&1;v>>>=n;}
+        else if(o.n===7){c.cf=(v>>>(n-1))&1;if(v&sign)v|=b===8?-256:-65536;v>>=n;}
+        else if(o.n===4){c.cf=(v>>>(b-n))&1;v<<=n;}else throw Error('Unsupported shift');
+        v&=b===8?255:65535;o.m.set(c,v);c.zf=v===0;c.sf=!!(v&sign);};
+    }else if(op===0xc3){fn=c=>c.ip=c.pop();
+    }else if(op===0xc7){const o=modrm(width),v=imm(width);fn=c=>o.m.set(c,v);
+    }else if(op===0xd7){const sg=seg<0?3:seg;fn=c=>c.wb(0,c.mem[(c.s[sg]<<4)+((c.r[3]+c.rb(0))&65535)]);
+    }else if(op===0xd4){const base=u8();fn=c=>{if(!base)throw Error('Division fault');const a=c.rb(0),v=a%base;c.r[0]=(Math.floor(a/base)<<8)|v;c.zf=v===0;c.sf=!!(v&128);};
+    }else if(op===0xcd){const n=u8();fn=c=>{if(n===0x10&&c.r[0]===0x13){c.resetVideo();}else if(n===0x16&&c.rb(4)===0)c.waiting=true;else throw Error('Unsupported BIOS call '+n.toString(16));};
+    }else if(op>=0xe0&&op<=0xe3){const d=i8(),t=(p+d)&65535;fn=c=>{if(op!==0xe3){c.r[1]--;if(c.r[1]&&(op===0xe2||(op===0xe1?c.zf:!c.zf)))c.ip=t;}else if(c.r[1]===0)c.ip=t;};
+    }else if(op===0xe8||op===0xe9||op===0xeb){const d=op===0xeb?i8():i16(),next=p&65535,t=(p+d)&65535;fn=c=>{if(op===0xe8)c.push(next);c.ip=t;};
+    }else if(op===0xee){fn=c=>c.out(c.r[2],c.rb(0));
+    }else if(op===0xef){if(width!==16)throw Error('32-bit OUT unsupported');fn=c=>c.out(c.r[2],c.r[0],16);
+    }else if(op===0xf6||op===0xf7){const b=op===0xf6?8:width,o=modrm(b);if(o.n===0){const v=imm(b);fn=c=>c.alu(4,o.m.get(c),v,b);}else if(o.n===2){if(b===32)throw Error('32-bit NOT unsupported');fn=c=>o.m.set(c,~o.m.get(c));}else if(o.n===3)fn=c=>o.m.set(c,c.alu(5,0,o.m.get(c),b));else if((o.n===4||o.n===5)&&b===8)fn=c=>{const left=c.rb(0),right=o.m.get(c),v=o.n===4?left*right:((left<<24)>>24)*((right<<24)>>24);c.r[0]=v;c.cf=o.n===4?v>255:v<-128||v>127;c.of=c.cf;};else if(o.n===4&&b===16)fn=c=>{const v=c.r[0]*o.m.get(c);c.r[0]=v;c.r[2]=Math.floor(v/65536);c.cf=v>65535;c.of=c.cf;};else if(o.n===6)fn=c=>{const d=o.m.get(c),n=c.r[2]*65536+c.r[0],q=Math.floor(n/d);if(!d||q>65535)throw Error('Division fault');c.r[0]=q;c.r[2]=n%d;};else throw Error('Unsupported F7 operation');
+    }else if(op===0xf8||op===0xf9){fn=c=>c.cf=op===0xf9;
+    }else if(op===0xfc){fn=c=>c.df=0;
+    }else if(op===0xfe||op===0xff){const b=op===0xfe?8:width,o=modrm(b);if(o.n>1)throw Error('Unsupported FE/FF operation');fn=c=>{const f=c.cf;o.m.set(c,c.alu(o.n===1?5:0,o.m.get(c),1,b));c.cf=f;};
+    }else if(op===0x0f){const n=u8();
+      if(n===0xaf){if(width!==16)throw Error('32-bit IMUL unsupported');const o=modrm(16);fn=c=>{const v=(o.r.get(c)<<16>>16)*(o.m.get(c)<<16>>16);o.r.set(c,v);c.cf=v<-32768||v>32767;c.of=c.cf;};}
+      else if(n>=0x90&&n<=0x9f){if((n&15)===10||(n&15)===11)throw Error('Unsupported condition');const o=modrm(8);fn=c=>o.m.set(c,c.cond(n&15)?1:0);}
+      else if(n>=0x80&&n<=0x8f){const d=i16(),t=(p+d)&65535;fn=c=>{if(c.cond(n&15))c.ip=t;};}
+      else throw Error('Unsupported 0F operation');
+    }else throw Error('Unsupported opcode '+op.toString(16)+' at '+start.toString(16));
+    return {next:p&65535,fn};
+  }
+  compileLoop(code){
+    // local registers for speed, writes still wrap to 16 bits
+    // stack stays in emulated memory; unsupported helpers use the old path
+    const original=code;
+    if(/c\.(cache|alu|rb|wb|decode)/.test(code))return new Function('c','budget',code);
+    code=code.replace(/c\.push\(([^;]+)\);/g,(_,value)=>`t=${value};r[4]=(r[4]-2)&65535;c.write((s[2]<<4)+r[4],t,16);`);
+    code=code.replace(/([a-zA-Z0-9_.\[\]]+)=c\.pop\(\);/g,(_,destination)=>`t=c.read((s[2]<<4)+r[4],16);r[4]=(r[4]+2)&65535;${destination}=t;`);
+    if(/c\.(push|pop)/.test(code))return new Function('c','budget',original);
+    const used=new Set(),written=new Set();
+    for(const match of code.matchAll(/([rs])\[(\d)\]/g))used.add(match[1]+match[2]);
+    code=code.replace(/([rs])\[(\d)\](\+\+|--|[+\-]?=(?!=))([^;]*);/g,(_,bank,index,op,value)=>{
+      const name=bank+index;written.add(name);
+      const expression=op==='++'?`${name}+1`:op==='--'?`${name}-1`:op==='='?value:`${name}${op[0]}(${value})`;
+      return `${name}=(${expression})&65535;`;
+    });
+    code=code.replace(/([rs])\[(\d)\]/g,'$1$2');
+    const flags=new Set(Array.from(code.matchAll(/c\.(cf|of|zf|sf|ip)/g),m=>m[1]));
+    const flagWrites=new Set(Array.from(code.matchAll(/c\.(cf|of|zf|sf|ip)=(?!=)/g),m=>m[1]));
+    code=code.replace(/c\.(cf|of|zf|sf|ip)/g,'$1');
+    // drop the old aliases before setting up local registers
+    code=code.replace('const r=c.r,s=c.s,m=c.mem;','const m=c.mem;');
+    const declarations=[...Array.from(used,name=>`${name}=c.${name[0]}[${name[1]}]`),...Array.from(flags,name=>`${name}=c.${name}`)];
+    const flush=[...Array.from(written,name=>`c.${name[0]}[${name[1]}]=${name};`),...Array.from(flagWrites,name=>`c.${name}=${name};`)].join('');
+    const source=`let t,${declarations.join(',')};try{${code}}finally{${flush}}`;
+    return new Function('c','budget',source);
+  }
+  // x86 -> JS, fall back to the decoder if there's no fast path
+  translate(start){
+    let p=start,width=16,seg=-1,rep=false;
+    const u8=()=>this.mem[(this.s[1]<<4)+(p++&65535)],u16=()=>u8()|(u8()<<8),i8=()=>u8()<<24>>24,i16=()=>u16()<<16>>16;
+    const imm=b=>b===8?u8():b===16?u16():(u16()|u16()<<16)>>>0;
+    let op=u8();
+    while([0x26,0x2e,0x36,0x3e,0x66,0xf3].includes(op)){
+      if(op===0x66)width=32;else if(op===0xf3)rep=true;else seg=({38:0,46:1,54:2,62:3})[op];op=u8();
+    }
+    const reg=(n,b)=>({get:b===8?(n<4?`(r[${n}]&255)`:`(r[${n-4}]>>>8)`):`r[${n}]`,set:v=>b===8?(n<4?`r[${n}]=(r[${n}]&65280)|((${v})&255);`:`r[${n-4}]=(r[${n-4}]&255)|(((${v})&255)<<8);`):`r[${n}]=${v};`});
+    const mem=(a,b)=>({get:b===8?`m[${a}]`:`c.read(${a},${b})`,set:v=>b===8?`m[${a}]=${v};`:`c.write(${a},${v},${b});`});
+    const modrm=b=>{
+      const q=u8(),mode=q>>>6,n=q>>>3&7,rm=q&7;
+      if(mode===3)return {n,r:reg(n,b),m:reg(rm,b)};
+      let d=0,base,ss=false;
+      if(mode===0&&rm===6){d=u16();base='0';}
+      else{base=['r[3]+r[6]','r[3]+r[7]','r[5]+r[6]','r[5]+r[7]','r[6]','r[7]','r[5]','r[3]'][rm];ss=[2,3,6].includes(rm);}
+      if(mode===1)d=i8();else if(mode===2)d=i16();
+      const sg=seg<0?(ss?2:3):seg,a=`((s[${sg}]<<4)+((${base}+${d})&65535))`;
+      return {n,r:reg(n,b),m:mem(a,b)};
+    };
+    const alu=(kind,dst,src,b,write=true)=>{
+      const mask=b===8?255:b===16?65535:4294967295,sign=b===8?128:b===16?32768:2147483648;
+      const setup=`a=${dst.get};b=${src};`;
+      let calc;
+      if(kind===0||kind===2)calc=`v=a+b${kind===2?'+(c.cf?1:0)':''};c.cf=v>${mask};c.of=!!((~(a^b)&(a^v))&${sign});`;
+      else if(kind===3||kind===5||kind===7)calc=`v=a-b${kind===3?'-(c.cf?1:0)':''};c.cf=(a>>>0)<((b>>>0)${kind===3?'+(c.cf?1:0)':''});c.of=!!(((a^b)&(a^v))&${sign});`;
+      else if([1,4,6].includes(kind))calc=`v=a${({1:'|',4:'&',6:'^'})[kind]}b;c.cf=false;c.of=false;`;
+      else throw Error('Unsupported ALU operation '+kind);
+      return setup+calc+`v=(v&${mask})>>>0;c.zf=v===0;c.sf=!!(v&${sign});`+(write&&kind!==7?dst.set('v'):'');
+    };
+    const conditions=['c.of','!c.of','c.cf','!c.cf','c.zf','!c.zf','c.cf||c.zf','!c.cf&&!c.zf','c.sf','!c.sf',null,null,'c.sf!==c.of','c.sf===c.of','c.zf||c.sf!==c.of','!c.zf&&c.sf===c.of'];
+    let code='',targets=[],terminal=false,slow=false;
+    const jump=(condition,d)=>{const t=(p+d)&65535;targets.push(t);terminal=true;code=`c.ip=(${condition})?${t}:${p&65535};`;};
+    if(op<=0x3b&&(op&7)<=3){const kind=op>>>3,b=op&1?width:8,o=modrm(b),dst=op&2?o.r:o.m,src=op&2?o.m:o.r;code=alu(kind,dst,src.get,b);
+    }else if(op<=0x3d&&((op&7)===4||(op&7)===5)){const kind=op>>>3,b=op&1?width:8,v=imm(b);code=alu(kind,reg(0,b),v,b);
+    }else if(op>=0x40&&op<=0x4f){code=alu(op&8?5:0,reg(op&7,16),1,16).replace(/c\.cf=[^;]+;/g,'');
+    }else if(op>=0x50&&op<=0x57){code=`c.push(r[${op&7}]);`;
+    }else if(op>=0x58&&op<=0x5f){code=`r[${op&7}]=c.pop();`;
+    }else if([6,14,22,30].includes(op)){code=`c.push(s[${(op-6)/8}]);`;
+    }else if([7,23,31].includes(op)){code=`s[${(op-7)/8}]=c.pop();`;
+    }else if(op===0x68||op===0x6a){code=`c.push(${op===0x6a?i8():u16()});`;
+    }else if(op===0x69||op===0x6b){const o=modrm(width),value=op===0x6b?i8():i16();if(width!==16)throw Error('32-bit IMUL unsupported');code=`v=((${o.m.get}<<16)>>16)*${value};`+o.r.set('v')+'c.cf=v<-32768||v>32767;c.of=v<-32768||v>32767;';
+    }else if(op===0x6e){const sg=seg<0?3:seg;code=`v=${rep?'r[1]':'1'};while(v--){c.out(r[2],m[(s[${sg}]<<4)+r[6]]);r[6]+=c.df?-1:1;}${rep?'r[1]=0;':''}`;
+    }else if(op>=0x70&&op<=0x7f){const d=i8();if(conditions[op&15]===null)throw Error('Unsupported condition');jump(conditions[op&15],d);
+    }else if([0x80,0x81,0x83].includes(op)){const b=op===0x80?8:width,o=modrm(b),v=op===0x83?(i8()&(b===32?0xffffffff:65535))>>>0:imm(b);code=alu(o.n,o.m,v,b);
+    }else if(op===0x84||op===0x85){const b=op&1?width:8,o=modrm(b);code=alu(4,o.m,o.r.get,b,false);
+    }else if(op>=0x88&&op<=0x8b){const b=op&1?width:8,o=modrm(b),dst=op&2?o.r:o.m,src=op&2?o.m:o.r;code=dst.set(src.get);
+    }else if(op===0x8e){const o=modrm(16);code=`s[${o.n}]=${o.m.get};`;
+    }else if(op>=0x90&&op<=0x97){const n=op&7;code=`v=r[0];r[0]=r[${n}];r[${n}]=v;`;
+    }else if(op===0x98){if(width!==16)throw Error('32-bit CWDE unsupported');code='r[0]=(r[0]<<24)>>24;';
+    }else if(op>=0xa0&&op<=0xa3){const b=op&1?width:8,offset=u16(),sg=seg<0?3:seg;if(b===32)throw Error('32-bit moffs MOV unsupported');const operand=mem(`((s[${sg}]<<4)+${offset})`,b),accumulator=reg(0,b);code=op&2?operand.set(accumulator.get):accumulator.set(operand.get);
+    }else if(op===0xad){if(width!==16)throw Error('32-bit LODS unsupported');const sg=seg<0?3:seg;code=`v=${rep?'r[1]':'1'};while(v--){r[0]=c.read((s[${sg}]<<4)+r[6],16);r[6]+=c.df?-2:2;}${rep?'r[1]=0;':''}`;
+    }else if(op===0xa8||op===0xa9){const b=op===0xa8?8:width,v=imm(b);code=alu(4,reg(0,b),v,b,false);
+    }else if(op===0xab){code='c.write((s[0]<<4)+r[7],r[0],16);r[7]+=c.df?-2:2;';
+    }else if(op>=0xb0&&op<=0xbf){const b=op<0xb8?8:width,d=reg(op&7,b),v=imm(b);code=d.set(v);
+    }else if([0xc0,0xc1,0xd0,0xd1].includes(op)){
+      const b=op&1?width:8,o=modrm(b),n=op<0xd0?u8()&31:1,sign=b===8?128:32768;
+      if(n){code=`v=${o.m.get};`;
+        if(o.n===5)code+=`c.cf=(v>>>${n-1})&1;v>>>=${n};`;
+        else if(o.n===7)code+=`c.cf=(v>>>${n-1})&1;if(v&${sign})v|=${b===8?-256:-65536};v>>=${n};`;
+        else if(o.n===4)code+=`c.cf=(v>>>${b-n})&1;v<<=${n};`;
+        else throw Error('Unsupported shift');
+        code+=`v&=${b===8?255:65535};`+o.m.set('v')+`c.zf=v===0;c.sf=!!(v&${sign});`;
+      }
+    }else if(op===0xc3){code='c.ip=c.pop();';terminal=true;
+    }else if(op===0xc7){const o=modrm(width),v=imm(width);code=o.m.set(v);
+    }else if(op===0xd7){const sg=seg<0?3:seg;code=`r[0]=(r[0]&65280)|m[(s[${sg}]<<4)+((r[3]+(r[0]&255))&65535)];`;
+    }else if(op===0xd4){const base=u8();code=`if(!${base})throw Error('Division fault');a=r[0]&255;v=a%${base};r[0]=(Math.floor(a/${base})<<8)|v;c.zf=v===0;c.sf=!!(v&128);`;
+    }else if(op===0xcd){const n=u8();code=`c.ip=${p&65535};if(${n}===16&&r[0]===19){c.resetVideo();}else if(${n}===22&&(r[0]>>>8)===0)c.waiting=true;else throw Error('Unsupported BIOS call ${n.toString(16)}');`;terminal=true;
+    }else if(op>=0xe0&&op<=0xe3){const d=i8();jump(op===0xe3?'r[1]===0':op===0xe2?'r[1]!==0':op===0xe1?'r[1]!==0&&c.zf':'r[1]!==0&&!c.zf',d);if(op!==0xe3)code='r[1]--;'+code;
+    }else if(op===0xe8||op===0xe9||op===0xeb){const d=op===0xeb?i8():i16(),t=(p+d)&65535;targets.push(t);terminal=true;code=(op===0xe8?`c.push(${p&65535});`:'')+`c.ip=${t};`;
+    }else if(op===0xee){code='c.out(r[2],r[0]&255);';
+    }else if(op===0xef){if(width!==16)throw Error('32-bit OUT unsupported');code='c.out(r[2],r[0],16);';
+    }else if(op===0xf6||op===0xf7){const b=op===0xf6?8:width,o=modrm(b);
+      if(o.n===0){const v=imm(b);code=alu(4,o.m,v,b,false);}
+      else if(o.n===2){if(b===32)throw Error('32-bit NOT unsupported');code=o.m.set(`~(${o.m.get})`);}
+      else if(o.n===3){code=`b=${o.m.get};`+alu(5,{get:'0',set:o.m.set},'b',b);}
+      else if((o.n===4||o.n===5)&&b===8){const product=o.n===4?`(r[0]&255)*${o.m.get}`:`((r[0]<<24)>>24)*((${o.m.get}<<24)>>24)`,overflow=o.n===4?'v>255':'v<-128||v>127';code=`v=${product};r[0]=v;c.cf=${overflow};c.of=${overflow};`;}
+      else if(o.n===4&&b===16)code=`v=r[0]*${o.m.get};r[0]=v;r[2]=Math.floor(v/65536);c.cf=v>65535;c.of=v>65535;`;
+      else if(o.n===6)code=`a=${o.m.get};b=r[2]*65536+r[0];v=Math.floor(b/a);if(!a||v>65535)throw Error('Division fault');r[0]=v;r[2]=b%a;`;
+      else throw Error('Unsupported F7 operation');
+    }else if(op===0xf8||op===0xf9){code=`c.cf=${op===0xf9};`;
+    }else if(op===0xfc){code='c.df=0;';
+    }else if(op===0xfe||op===0xff){const b=op===0xfe?8:width,o=modrm(b);if(o.n>1)throw Error('Unsupported FE/FF operation');code=alu(o.n===1?5:0,o.m,1,b).replace(/c\.cf=[^;]+;/g,'');
+    }else if(op===0x0f){const n=u8();
+      if(n===0xaf){if(width!==16)throw Error('32-bit IMUL unsupported');const o=modrm(16);code=`v=((${o.r.get}<<16)>>16)*((${o.m.get}<<16)>>16);`+o.r.set('v')+'c.cf=v<-32768||v>32767;c.of=v<-32768||v>32767;';}
+      else if(n>=0x90&&n<=0x9f){if(conditions[n&15]===null)throw Error('Unsupported condition');const o=modrm(8);code=o.m.set(`(${conditions[n&15]})?1:0`);}
+      else if(n>=0x80&&n<=0x8f&&conditions[n&15]!==null){const d=i16();jump(conditions[n&15],d);}
+      else throw Error('Unsupported 0F operation');
+    }else{
+      // supported but no fast path, use the decoder
+      const decoded=this.decode(start);this.cache.set(start,decoded);p=decoded.next;slow=true;
+      code=`c.ip=${p&65535};c.cache.get(${start}).fn(c);`;terminal=true;
+    }
+    const fallthrough=!(op===0xc3||op===0xe9||op===0xeb);
+    const writes=new Set(Array.from(code.matchAll(/c\.(cf|zf|sf|of)=[^=]/g),x=>x[1]));
+    const reads=new Set(Array.from(code.replace(/c\.(cf|zf|sf|of)=(?!=)[^;]+;/g,'').matchAll(/c\.(cf|zf|sf|of)/g),x=>x[1]));
+    if(op===0xcd||slow)for(const f of ['cf','zf','sf','of'])reads.add(f);
+    return {start,next:p&65535,code,targets,terminal,fallthrough,op,writes,reads,live:new Set()};
+  }
+  compile(){
+    const instructions=new Map(),leaders=new Set([this.ip]),work=[this.ip];
+    while(work.length){
+      let ip=work.pop();
+      while(!instructions.has(ip)){
+        const i=this.translate(ip);instructions.set(ip,i);
+        for(const t of i.targets){leaders.add(t);work.push(t);}
+        if(i.terminal){if(i.fallthrough){leaders.add(i.next);work.push(i.next);}break;}
+        ip=i.next;
+        if(instructions.size>65536)throw Error('Code graph exceeded 16-bit address space');
+      }
+    }
+    // inline small leaf routines: no loops, calls, stores, segment writes or SP changes
+    // push/pop must balance on every return path; keep the return address in memory
+    const flags=['cf','zf','sf','of'];
+    const union=sets=>new Set(sets.flatMap(set=>Array.from(set)));
+    const intersect=sets=>new Set(flags.filter(flag=>sets.every(set=>set.has(flag))));
+    let inlinedCalls=0;
+    for(const call of instructions.values()){
+      if(call.op!==0xe8)continue;
+      const entry=call.targets[0],nodes=new Map();let emitted=0,valid=true;
+      const inspect=(address,depth=0,path=new Set())=>{
+        if(path.has(address)||address<entry||address-entry>128||++emitted>96){valid=false;return null;}
+        const i=instructions.get(address);
+        if(!i||nodes.size>=32&&!nodes.has(address)){valid=false;return null;}
+        if(nodes.has(address)&&nodes.get(address).depth!==depth){valid=false;return null;}
+        const node=nodes.get(address)||{...i,raw:i.code,depth};nodes.set(address,node);
+        if(i.op===0xc3){if(depth!==0)valid=false;node.successors=[];return {reads:new Set(),writes:new Set(),maxCost:1};}
+        let nextDepth=depth;
+        if(i.op>=0x50&&i.op<=0x57){if(i.op===0x54){valid=false;return null;}nextDepth++;}
+        else if(i.op>=0x58&&i.op<=0x5f){if(i.op===0x5c||!depth){valid=false;return null;}nextDepth--;}
+        else if(i.op===0x68||i.op===0x6a)nextDepth++;
+        else if(/c\.(push|pop)|r\[4\]|c\.write|m\[[^;]+?\]\s*=|s\[[^;]+?\]\s*=/.test(i.code)){valid=false;return null;}
+        if(i.op===0xe8||i.op===0xcd||i.op===0x8e){valid=false;return null;}
+        const conditional=i.code.match(/^c\.ip=\((.+)\)\?(\d+):(\d+);$/);
+        const direct=i.code.match(/^c\.ip=(\d+);$/);
+        if(i.terminal){
+          if(conditional&&((i.op>=0x70&&i.op<=0x7f)||i.op===0x0f))node.successors=[Number(conditional[2]),Number(conditional[3])];
+          else if(direct&&(i.op===0xe9||i.op===0xeb))node.successors=[Number(direct[1])];
+          else {valid=false;return null;}
+          if(node.successors.some(target=>target<=address)){valid=false;return null;}
+          node.condition=conditional&&conditional[1];
+        }else node.successors=[i.next];
+        const children=node.successors.map(target=>inspect(target,nextDepth,new Set([...path,address])));
+        if(children.some(child=>!child)){valid=false;return null;}
+        const reads=union(children.map(child=>child.reads));for(const flag of i.writes)reads.delete(flag);for(const flag of i.reads)reads.add(flag);
+        return {reads,writes:union([i.writes,intersect(children.map(child=>child.writes))]),maxCost:1+Math.max(...children.map(child=>child.maxCost))};
+      };
+      const summary=inspect(entry);if(!valid||!summary)continue;
+      const dynamic=Array.from(nodes.values()).some(node=>node.successors.length>1);
+      call.inlineLeaf={entry,nodes,dynamic};call.targets=[];call.cost=dynamic?1:summary.maxCost+1;call.maxCost=summary.maxCost+1;call.inlined=true;
+      call.reads=summary.reads;call.writes=summary.writes;inlinedCalls++;
+    }
+    const emitLeaf=call=>{
+      const {entry,nodes,dynamic}=call.inlineLeaf,memo=new Map();
+      const liveBefore=address=>{
+        if(memo.has(address))return memo.get(address);
+        const node=nodes.get(address);
+        node.liveOut=node.op===0xc3?new Set(call.out):union(node.successors.map(liveBefore));
+        const live=new Set(node.liveOut);for(const flag of node.writes)live.delete(flag);for(const flag of node.reads)live.add(flag);memo.set(address,live);return live;
+      };
+      liveBefore(entry);
+      const emit=address=>{
+        let prefix='',count=0;
+        while(true){
+          const node=nodes.get(address),code=node.raw.replace(/c\.(cf|zf|sf|of)=(?!=)[^;]+;/g,(statement,flag)=>node.liveOut.has(flag)?statement:'');
+          count++;
+          const increment=dynamic?`n+=${count};`:'';
+          if(node.op===0xc3)return prefix+increment+code+`break leaf${call.start};`;
+          if(node.condition)return prefix+increment+`if(${node.condition}){${emit(node.successors[0])}}else{${emit(node.successors[1])}}`;
+          if(!node.terminal)prefix+=code;
+          address=node.successors[0];
+        }
+      };
+      return `c.push(${call.next});leaf${call.start}:{${emit(entry)}}`;
+    };
+    this.inlinedCalls=inlinedCalls;
+    // work backwards, skip flag writes that get overwritten before use
+    // interrupts still need all flags
+    const returnTargets=Array.from(instructions.values()).filter(i=>i.op===0xe8).map(i=>i.next);
+    let changed=true;
+    while(changed){changed=false;
+      for(const i of Array.from(instructions.values()).reverse()){
+        const next=[...i.targets];if(i.fallthrough)next.push(i.next);if(i.op===0xc3)next.push(...returnTargets);
+        const live=new Set();for(const address of next)for(const f of instructions.get(address)?.live||[])live.add(f);
+        i.out=live;const input=new Set(i.reads);for(const f of live)if(!i.writes.has(f))input.add(f);
+        if(input.size!==i.live.size||Array.from(input).some(f=>!i.live.has(f))){i.live=input;changed=true;}
+      }
+    }
+    for(const i of instructions.values())i.code=i.inlineLeaf?emitLeaf(i):i.code.replace(/c\.(cf|zf|sf|of)=(?!=)[^;]+;/g,(statement,f)=>i.out.has(f)?statement:'');
+    // branches/returns go through the block switch
+    // budget can run over by one block, not a whole unbounded loop
+    const blocks=[],bodies=new Map();let blockCount=0;
+    for(const start of leaders){
+      let ip=start,code='',n=0,maxN=0,last;
+      while(true){
+        const i=instructions.get(ip);if(!i)break;
+        code+=i.code;n+=i.cost||1;maxN+=i.maxCost||i.cost||1;ip=i.next;last=i;
+        if(i.terminal)break;
+        if(leaders.has(ip)){code+=`c.ip=${ip};`;break;}
+      }
+      if(n){bodies.set(start,{code,n,maxN,last});blocks[start]=new Function('c','budget', `let n=${n},a,b,v,f;const r=c.r,s=c.s,m=c.mem;${code}return n;`);blockCount++;}
+    }
+    // keep small loops in one function, size limits based on decoded blocks
+    for(const start of leaders){
+      const ends=Array.from(instructions.values()).filter(i=>i.start>=start&&i.targets.includes(start)).sort((a,b)=>a.start-b.start);
+      for(const end of ends){
+        const region=Array.from(bodies.entries()).filter(([a])=>a>=start&&a<=end.start);
+        if(region.length>8||region.reduce((n,[,b])=>n+b.maxN,0)>100)break;
+        const members=new Map(region);let emitted=0;
+        const emit=(address,seen=new Set())=>{
+          if(address===start&&seen.size)return 'continue run;';
+          if(!members.has(address)||seen.has(address)||emitted>400)return 'break run;';
+          const body=members.get(address),visited=new Set([...seen,address]);emitted+=body.maxN;
+          const head=`if(n>=budget||c.waiting)break run;n+=${body.n};`;
+          const conditional=body.code.match(/c\.ip=\((.+)\)\?(\d+):(\d+);$/);
+          if(conditional){const [tail,condition,yes,no]=conditional;return head+body.code.slice(0,-tail.length)+`if(${condition}){c.ip=${yes};${emit(Number(yes),visited)}}else{c.ip=${no};${emit(Number(no),visited)}}`;}
+          const direct=body.code.match(/c\.ip=(\d+);$/);
+          if(direct)return head+body.code+emit(Number(direct[1]),visited);
+          if(body.last?.inlined)return head+body.code+`if(c.ip!==${body.last.next})break run;`+emit(body.last.next,visited);
+          return head+body.code+'break run;';
+        };
+        blocks[start]=this.compileLoop(`let n=0,a,b,v,f;const r=c.r,s=c.s,m=c.mem;run:while(n<budget&&!c.waiting){${emit(start)}}return n;`);
+        break;
+      }
+    }
+    this.compiled=(c,budget)=>{let n=0;while(!c.waiting&&n<budget){const block=blocks[c.ip];if(!block)throw Error('Uncompiled instruction '+c.ip.toString(16));n+=block(c,budget-n);}return n;};
+    this.compiledCS=this.s[1];this.blockCount=blockCount;
+  }
+
+  invalidate(){this.cache.clear();this.compiled=null;}
+  run(budget=1000000){
+    if(this.waiting)return true;
+    if(!this.compiled || this.compiledCS!==this.s[1])this.compile();
+    const used=this.compiled(this,budget);
+    this.instructions+=used;
+    return this.waiting;
+  }
+  key(ax){if(!this.waiting)throw Error('CPU is not at a keyboard wait');this.r[0]=ax;this.waiting=false;}
+}
+if(typeof module!=='undefined')module.exports=Mini86;
+
+</script><script>
+'use strict';
+// keyboard queue, no camera or world state here
+class InputController {
+  constructor({repeatMs=33, actionMaxAgeMs=180, maxActions=2, opposing=[]}={}) {
+    this.repeatMs=repeatMs;
+    this.actionMaxAgeMs=actionMaxAgeMs;
+    this.maxActions=maxActions;
+    this.opposing=opposing;
+    this.clear();
+  }
+  clear() {
+    this.held=new Map();
+    this.lastServed=new Map();
+    this.actions=[];
+    this.serial=0;
+    this.lastSent=-Infinity;
+  }
+  press(source,key) {
+    if(this.held.has(source))return false;
+    this.held.set(source,{key,order:++this.serial});
+    return true;
+  }
+  release(source) {
+    const released=this.held.get(source);
+    if(!released)return false;
+    this.held.delete(source);
+    if(!Array.from(this.held.values()).some(item=>item.key===released.key))this.lastServed.delete(released.key);
+    return true;
+  }
+  tap(key,now) {
+    this.prune(now);
+    if(this.actions.length>=this.maxActions)return false;
+    this.actions.push({key,at:now});
+    return true;
+  }
+  prune(now) {
+    this.actions=this.actions.filter(action=>now-action.at<=this.actionMaxAgeMs);
+  }
+  keys() {
+    return new Set(Array.from(this.held.values(),item=>item.key));
+  }
+  available() {
+    const unique=new Map();
+    for(const item of this.held.values()) {
+      if(!unique.has(item.key)||unique.get(item.key).order<item.order)unique.set(item.key,item);
+    }
+    for(const [a,b] of this.opposing)if(unique.has(a)&&unique.has(b)){unique.delete(a);unique.delete(b);}
+    return unique;
+  }
+  delay(now) {
+    this.prune(now);
+    if(!this.actions.length&&!this.available().size)return Infinity;
+    return Math.max(0,this.lastSent+this.repeatMs-now);
+  }
+  take(now) {
+    if(this.delay(now)>0)return null;
+    let key;
+    if(this.actions.length)key=this.actions.shift().key;
+    else {
+      // dedupe held keys, pick the one that's waited longest
+      // new presses get a turn without blocking keys already held
+      const unique=this.available();
+      let chosen=null;
+      for(const item of unique.values()) {
+        const served=this.lastServed.get(item.key)??-Infinity;
+        if(!chosen||served<chosen.served||(served===chosen.served&&item.order>chosen.order))chosen={...item,served};
+      }
+      if(!chosen)return null;
+      key=chosen.key;
+      this.lastServed.set(key,++this.serial);
+    }
+    this.lastSent=now;
+    return key;
+  }
+}
+if(typeof module!=='undefined')module.exports=InputController;
+const binary=Uint8Array.from(atob('McCO0LwAfPywE80QutQDuAlD72gAoAdoAIAfMduJ2NHo1BAtCAeI4vbolojQ9ugB8MHoBDwFcgKwBQQHiPrA6gI4wrCLdwYYwPbQJI+IB0N5y2ooagC4ACJQaAAWUInlg2YGP2aDTgr/v6CAifqA5n+B6qAAuMAA6DkBiVYOiUYSi0YIhf94A4PoZIlGEFhaXlZSULlgAOj4AFMDRg4DVhADdhLo6wByCXVNg8QC4urrR4jMWYnOMd66AHyF1nUFweoF6/eF/3kPiV4KIdYx3oD8WHcDiXYM9sZ8igd1CfbCH7CKdQIER4D8SHMCBBg7Xgp1ByxI6wNbsGaF/3hQiMSrgcc+AYNGEAKB/wB9D4J8/4HvAn0PiVL/McDNFoTAdQKI4JK+5X25DAA2rTjU4Pp1GZiSgPkKchpBgOH+ic6LGoT/eAaEF3UCiBfpEf+/QH7rvoDh/ot2BPbBCnUTMcCEyXQBklboSgBeAcaSMdLrB4D5AnUVMcADRgADVgLoEAB1BoPEBlZSUOvAic4BEuu6ifMJwwnTeBlQifPB6wWB4+ADwegKCcOJ0CUAfAnDWDovw4tOBlGD4Q/jHGvYGWvyGQHGg8Z/wf4IKfAp04PrgMH7CAHa4uRZwekE4wWS99ji+8OPIAAIAlD+SAFl/3Fgd6BzYGagcmBkoGEAVao='),x=>x.charCodeAt(0));
+const canvas=document.getElementById('view'),ctx=canvas.getContext('2d',{alpha:false}),errorEl=document.getElementById('error');
+const cpuSource=document.getElementById('cpu-source').textContent;
+// worker connects the CPU, display and keyboard; the binary runs the game
+const workerSource=cpuSource+`\nlet cpu;onmessage=e=>{try{const data=e.data;if(data.type==='boot')cpu=new Mini86(data.binary);else if(data.type==='key')cpu.key(data.key);else return;const t=performance.now();let chunks=0;while(!cpu.run(2000000))if(++chunks>100)throw Error('CPU instruction budget exceeded');const pixels=new Uint8ClampedArray(320*200*4);for(let y=0;y<200;y++){const row=cpu.displayOffset(0,y);for(let x=0;x<320;x++){const rgb=cpu.palette[cpu.mem[0xa0000+row+x]],j=(y*320+x)*4;pixels[j]=rgb[0];pixels[j+1]=rgb[1];pixels[j+2]=rgb[2];pixels[j+3]=255;}}postMessage({type:'frame',pixels,ms:performance.now()-t},[pixels.buffer]);}catch(error){postMessage({type:'error',message:error.message});}};`;
+let worker,busy=true,failed=false,timer=null,paintRequest=null,pendingFrame=null,frameCount=0,lastSentKey=null;
+const input=new InputController({repeatMs:33,opposing:[[119,115],[97,100],[113,101],[114,102],[18432,20480]]});
+const frameMetrics=[];
+// recent frame timings for debugging, returns copies
+window.pocketCraftMetrics=()=>frameMetrics.map(frame=>({...frame}));
+const keys={w:119,a:97,s:115,d:100,q:113,e:101,r:114,f:102,ArrowUp:18432,ArrowDown:20480,Backspace:8,' ':32};
+function clearInput(){input.clear();clearTimeout(timer);timer=null;}
+function fail(message){failed=true;busy=false;clearInput();if(paintRequest!==null)cancelAnimationFrame(paintRequest);paintRequest=null;pendingFrame=null;errorEl.textContent=message;errorEl.hidden=false;}
+function schedule(){
+  clearTimeout(timer);timer=null;if(busy||failed||document.hidden)return;
+  const now=performance.now(),delay=input.delay(now);
+  if(!Number.isFinite(delay))return;
+  if(delay>0){timer=setTimeout(schedule,Math.ceil(delay));return;}
+  const key=input.take(now);
+  if(key!==null){busy=true;lastSentKey=key;worker.postMessage({type:'key',key});}
+}
+function press(source,key){if(failed||document.hidden||!input.press(source,key))return;schedule();}
+function release(source){if(input.release(source))schedule();}
+function tap(key){if(failed||document.hidden)return;input.tap(key,performance.now());schedule();}
+function presentFrame(timestamp,active){
+  paintRequest=null;if(worker!==active||!pendingFrame)return;
+  const frame=pendingFrame;pendingFrame=null;
+  ctx.putImageData(new ImageData(frame.pixels,320,200),0,0);
+  frameCount++;
+  canvas.dataset.frames=String(frameCount);canvas.dataset.lastFrameAt=String(timestamp);
+  frameMetrics.push({frame:frameCount,at:timestamp,completedAt:frame.completedAt,workerMs:frame.ms,key:frame.inputKey,held:Array.from(input.keys())});
+  if(frameMetrics.length>180)frameMetrics.shift();
+  schedule();
+}
+function reset(){
+  clearInput();worker?.terminate();if(paintRequest!==null)cancelAnimationFrame(paintRequest);paintRequest=null;pendingFrame=null;
+  failed=false;busy=true;frameCount=0;lastSentKey=null;frameMetrics.length=0;
+  errorEl.hidden=true;errorEl.textContent='';
+  try{
+    const url=URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}));
+    worker=new Worker(url);URL.revokeObjectURL(url);const active=worker;
+    worker.onmessage=e=>{
+      if(worker!==active)return;
+      if(e.data.type==='error'){fail(e.data.message);return;}
+      if(e.data.type!=='frame')return;
+      pendingFrame={...e.data,inputKey:lastSentKey,completedAt:performance.now()};
+      busy=false;
+      if(paintRequest===null)paintRequest=requestAnimationFrame(timestamp=>presentFrame(timestamp,active));
+      schedule();
+    };
+    worker.onerror=e=>{if(worker===active)fail(e.message||'The offline CPU worker could not start.');};
+    worker.postMessage({type:'boot',binary});
+  }catch(e){fail(e.message);}
+}
+window.addEventListener('keydown',e=>{
+  if(e.ctrlKey||e.metaKey||e.altKey||e.target?.isContentEditable||e.target?.matches?.('input,textarea,select'))return;
+  const key=e.key.length===1?e.key.toLowerCase():e.key;
+  if(key in keys){e.preventDefault();if(!e.repeat){if(keys[key]===8||keys[key]===32)tap(keys[key]);else press('key:'+e.code,keys[key]);}}
+});
+window.addEventListener('keyup',e=>release('key:'+e.code));
+window.addEventListener('blur',clearInput);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)clearInput();else schedule();});
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+canvas.addEventListener('pointerdown',e=>{canvas.focus({preventScroll:true});if(e.pointerType==='mouse'&&(e.button===0||e.button===2)){e.preventDefault();tap(e.button===2?32:8);}});
+reset();
+</script></body></html>
+
